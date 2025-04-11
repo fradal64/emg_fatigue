@@ -263,8 +263,13 @@ def visualize_model_predictions(
                 plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
                 # --- Save figure ---
+                # Create a separate folder for each participant
+                participant_dir = FIGURES_DIR / p_id
+                participant_dir.mkdir(parents=True, exist_ok=True)
+
+                # Save to participant-specific directory with a simpler filename
                 save_path = (
-                    FIGURES_DIR / f"predictions_{p_id}_{side}_rec{rec_index + 1}.png"
+                    participant_dir / f"predictions_{side}_rec{rec_index + 1}.png"
                 )
                 try:
                     plt.savefig(save_path)

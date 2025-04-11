@@ -4,6 +4,8 @@ import numpy as np
 import tensorflow as tf
 from loguru import logger
 
+from emg_fatigue.utils.augmentation import augment_data
+
 
 def ensure_label_shape(y_padded: np.ndarray) -> np.ndarray:
     """
@@ -98,6 +100,12 @@ def create_loocv_dataset(
     batch_size: int,
     padding_value: float,
     normalize: bool,
+    augment: bool = False,
+    time_param: int = 10,
+    time_masks: int = 1,
+    freq_param: int = 10,
+    freq_masks: int = 1,
+    augmentation_factor: int = 1,
 ) -> Tuple[
     Optional[tf.data.Dataset],
     Optional[tf.data.Dataset],
@@ -113,7 +121,9 @@ def create_loocv_dataset(
     Applies padding to handle variable sequence lengths. Assumes leave-one-out cross-validation
     structure but allows specifying multiple validation/test participants.
 
-    Applies optional normalization based on training data and padding for variable lengths.
+    Optionally applies optional normalization based on training data and padding for variable lengths.
+
+    Optionally applies SpecAugment (time and frequency masking) data augmentation on training data.
 
     Args:
         processed_data: Dictionary containing processed EMG data, including 'spectrogram' and 'labels'.
@@ -124,6 +134,12 @@ def create_loocv_dataset(
         batch_size: Batch size for the TensorFlow datasets.
         padding_value: Value to use for padding sequences.
         normalize: If True, apply Z-score normalization based on training data statistics.
+        augment: If True, apply SpecAugment data augmentation to the training data.
+        time_param: Maximum length of time mask for SpecAugment.
+        time_masks: Number of time masks to apply.
+        freq_param: Maximum number of frequency channels to mask for SpecAugment.
+        freq_masks: Number of frequency masks to apply.
+        augmentation_factor: Number of augmented copies to create for each original spectrogram.
 
     Returns:
         A tuple containing:
@@ -245,6 +261,39 @@ def create_loocv_dataset(
             )
             norm_mean = None
             norm_std = None
+
+    # --- Data Augmentation (Optional) ---
+    if augment and specs_by_set["train"]:
+        original_count = len(specs_by_set["train"])
+        original_labels = labels_by_set["train"]
+
+        logger.info("Applying SpecAugment data augmentation to training data...")
+        logger.info(f"  Time masking: param={time_param}, masks={time_masks}")
+        logger.info(f"  Frequency masking: param={freq_param}, masks={freq_masks}")
+        logger.info(f"  Augmentation factor: {augmentation_factor}")
+
+        # Augment spectrograms
+        augmented_specs = augment_data(
+            specs_by_set["train"],
+            time_param=time_param,
+            time_masks=time_masks,
+            freq_param=freq_param,
+            freq_masks=freq_masks,
+            augmentation_factor=augmentation_factor,
+        )
+
+        # Duplicate labels for augmented data
+        augmented_labels = list(original_labels)
+        for _ in range(augmentation_factor):
+            augmented_labels.extend(original_labels)
+
+        # Update training data
+        specs_by_set["train"] = augmented_specs
+        labels_by_set["train"] = augmented_labels
+
+        logger.info(
+            f"  Data augmentation complete. Training samples: {original_count} → {len(specs_by_set['train'])}"
+        )
 
     # --- Padding Sequences ---
     logger.info("Padding sequences...")
