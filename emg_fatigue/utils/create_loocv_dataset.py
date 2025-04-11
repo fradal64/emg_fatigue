@@ -2,6 +2,7 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import tensorflow as tf
+from loguru import logger
 
 
 def ensure_label_shape(y_padded: np.ndarray) -> np.ndarray:
@@ -37,17 +38,56 @@ def create_tf_dataset(
         TensorFlow dataset or None if creation fails
     """
     if len(X) == 0:
-        print("    Skipping dataset creation for empty data.")
+        logger.warning("    Skipping dataset creation for empty data.")
         return None
     try:
         dataset = tf.data.Dataset.from_tensor_slices((X, y))
         dataset = dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
-        print(f"    Dataset created successfully with {len(X)} sequences.")
+        logger.info(f"    Dataset created successfully with {len(X)} sequences.")
         return dataset
     except Exception as e:
-        print(f"    Error creating dataset: {e}")
-        print(f"    X shape: {X.shape}, y shape: {y.shape}")
+        logger.error(f"    Error creating dataset: {e}")
+        logger.error(f"    X shape: {X.shape}, y shape: {y.shape}")
         return None
+
+
+# --- Helper functions for Normalization ---
+
+
+def calculate_normalization_stats(
+    data_list: List[np.ndarray],
+) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+    """Calculate mean and std dev across all time steps and sequences for normalization."""
+    if not data_list:
+        return None, None
+    try:
+        # Concatenate all spectrograms along the time-step axis (axis 0)
+        # Each item in data_list is (time_steps, features)
+        all_data = np.concatenate(data_list, axis=0)
+        mean = np.mean(all_data, axis=0)
+        std = np.std(all_data, axis=0)
+        # Add a small epsilon to std dev to prevent division by zero
+        std = np.where(std == 0, 1e-6, std)
+        return mean, std
+    except ValueError as e:
+        logger.error(f"Error concatenating data for normalization: {e}")
+        # Log shapes for debugging
+        # for i, arr in enumerate(data_list):
+        #     logger.debug(f"    Shape of array {i}: {arr.shape}")
+        return None, None
+
+
+def normalize_data(
+    data_list: List[np.ndarray], mean: np.ndarray, std: np.ndarray
+) -> List[np.ndarray]:
+    """Normalize list of spectrograms using pre-calculated mean and std."""
+    if mean is None or std is None:
+        logger.warning("Normalization stats are None, skipping normalization.")
+        return data_list
+    return [(data - mean) / std for data in data_list]
+
+
+# --- Main Dataset Creation Function ---
 
 
 def create_loocv_dataset(
@@ -57,18 +97,23 @@ def create_loocv_dataset(
     test_participant_ids: List[str],
     batch_size: int,
     padding_value: float,
+    normalize: bool,
 ) -> Tuple[
     Optional[tf.data.Dataset],
     Optional[tf.data.Dataset],
     Optional[tf.data.Dataset],
     Optional[Tuple[int, int]],
     Optional[int],
+    Optional[np.ndarray],
+    Optional[np.ndarray],
 ]:
     """
     Creates TensorFlow datasets suitable for training an RNN using spectrograms and fatigue labels.
 
     Applies padding to handle variable sequence lengths. Assumes leave-one-out cross-validation
     structure but allows specifying multiple validation/test participants.
+
+    Applies optional normalization based on training data and padding for variable lengths.
 
     Args:
         processed_data: Dictionary containing processed EMG data, including 'spectrogram' and 'labels'.
@@ -78,6 +123,7 @@ def create_loocv_dataset(
         test_participant_ids: List of participant IDs for the test set.
         batch_size: Batch size for the TensorFlow datasets.
         padding_value: Value to use for padding sequences.
+        normalize: If True, apply Z-score normalization based on training data statistics.
 
     Returns:
         A tuple containing:
@@ -86,14 +132,18 @@ def create_loocv_dataset(
         - test_dataset: tf.data.Dataset for testing (or None if no test data).
         - input_shape: Tuple (max_sequence_length, num_features) for model input.
         - output_shape: Integer (max_sequence_length) for model output.
-        Returns (None, None, None, None, None) if no data is processed.
+        - norm_mean: Mean calculated from training spectrograms (or None).
+        - norm_std: Standard deviation calculated from training spectrograms (or None).
+        Returns (None, None, None, None, None, None, None) if no data is processed.
     """
     specs_by_set = {"train": [], "val": [], "test": []}
     labels_by_set = {"train": [], "val": [], "test": []}
     max_len = 0
     num_features = None
+    norm_mean = None
+    norm_std = None
 
-    print("Processing data for datasets...")
+    logger.info("Processing data for datasets...")
 
     # --- Collect data from specified participants ---
     for set_name, participant_ids in [
@@ -101,19 +151,21 @@ def create_loocv_dataset(
         ("val", validation_participant_ids),
         ("test", test_participant_ids),
     ]:
-        print(f"  Processing {set_name} set ({len(participant_ids)} participants)...")
+        logger.info(
+            f"  Processing {set_name} set ({len(participant_ids)} participants)..."
+        )
         for p_id in participant_ids:
             if p_id not in processed_data:
-                print(
+                logger.warning(
                     f"    Warning: Participant {p_id} not found in processed_data. Skipping."
                 )
                 continue
             for side in ["left", "right"]:
                 if side not in processed_data[p_id]:
-                    # print(f"    Debug: Side {side} not found for participant {p_id}.") # Optional debug
+                    # logger.debug(f"    Debug: Side {side} not found for participant {p_id}.") # Optional debug
                     continue
                 if not processed_data[p_id][side]:
-                    # print(f"    Debug: No recordings for {p_id} side {side}.") # Optional debug
+                    # logger.debug(f"    Debug: No recordings for {p_id} side {side}.") # Optional debug
                     continue
 
                 for recording_idx, recording in enumerate(processed_data[p_id][side]):
@@ -123,14 +175,14 @@ def create_loocv_dataset(
                     labels = recording.get("labels")
 
                     if spectrogram is None or labels is None:
-                        print(
+                        logger.warning(
                             f"    Warning: Missing 'spectrogram' or 'labels' for {p_id}/{side}/Rec{recording_idx}. Skipping."
                         )
                         continue
 
                     # Validate shapes: Spectrogram time dimension should match labels length
                     if spectrogram.shape[1] != len(labels):
-                        print(
+                        logger.warning(
                             f"    Warning: Shape mismatch for {p_id}/{side}/Rec{recording_idx}. "
                             f"Spectrogram time bins ({spectrogram.shape[1]}) != Label length ({len(labels)}). Skipping."
                         )
@@ -159,14 +211,43 @@ def create_loocv_dataset(
                     labels_by_set[set_name].append(labels)
 
     if num_features is None or max_len == 0:
-        print("Error: No valid data found to create datasets.")
-        return None, None, None, None, None
+        logger.error("Error: No valid data found to create datasets.")
+        return None, None, None, None, None, None, None
 
-    print(f"\nFound {num_features} frequency bins (features).")
-    print(f"Maximum sequence length across all sets: {max_len}.")
+    logger.info(f"\nFound {num_features} frequency bins (features).")
+    logger.info(f"Maximum sequence length across all sets: {max_len}.")
+
+    # --- Normalization (Optional) ---
+    if normalize:
+        logger.info("Calculating normalization statistics from training data...")
+        norm_mean, norm_std = calculate_normalization_stats(specs_by_set["train"])
+        if norm_mean is not None and norm_std is not None:
+            logger.info(
+                f"  Calculated Mean shape: {norm_mean.shape}, Std shape: {norm_std.shape}"
+            )
+            # logger.debug(f"  Mean values (sample): {norm_mean[:5]}") # Optional debug
+            # logger.debug(f"  Std values (sample): {norm_std[:5]}")   # Optional debug
+
+            logger.info("Applying normalization to all datasets...")
+            specs_by_set["train"] = normalize_data(
+                specs_by_set["train"], norm_mean, norm_std
+            )
+            specs_by_set["val"] = normalize_data(
+                specs_by_set["val"], norm_mean, norm_std
+            )
+            specs_by_set["test"] = normalize_data(
+                specs_by_set["test"], norm_mean, norm_std
+            )
+            logger.info("Normalization complete.")
+        else:
+            logger.error(
+                "Failed to calculate normalization statistics. Skipping normalization."
+            )
+            norm_mean = None
+            norm_std = None
 
     # --- Padding Sequences ---
-    print("Padding sequences...")
+    logger.info("Padding sequences...")
     padded_X = {}
     padded_y = {}
 
@@ -178,7 +259,7 @@ def create_loocv_dataset(
                 maxlen=max_len,
                 padding="post",
                 dtype="float32",
-                value=padding_value,
+                value=padding_value,  # Use padding value for features
                 truncating="post",
             )
             if specs_by_set[dataset_type]
@@ -200,7 +281,7 @@ def create_loocv_dataset(
         )
 
         # Print shape information
-        print(
+        logger.info(
             f"  Padded {dataset_type.capitalize()} data shape: X={padded_X[dataset_type].shape}, y={padded_y[dataset_type].shape}"
         )
 
@@ -214,16 +295,18 @@ def create_loocv_dataset(
     y_val_padded = ensure_label_shape(y_val_padded)
     y_test_padded = ensure_label_shape(y_test_padded)
 
-    print(
-        f"  Padded Training data shape: X={X_train_padded.shape}, y={y_train_padded.shape}"
+    logger.info(
+        f"  Standardized Training data shape: X={X_train_padded.shape}, y={y_train_padded.shape}"
     )
-    print(
-        f"  Padded Validation data shape: X={X_val_padded.shape}, y={y_val_padded.shape}"
+    logger.info(
+        f"  Standardized Validation data shape: X={X_val_padded.shape}, y={y_val_padded.shape}"
     )
-    print(f"  Padded Test data shape: X={X_test_padded.shape}, y={y_test_padded.shape}")
+    logger.info(
+        f"  Standardized Test data shape: X={X_test_padded.shape}, y={y_test_padded.shape}"
+    )
 
     # --- Create TensorFlow Datasets ---
-    print("Creating TensorFlow Datasets...")
+    logger.info("Creating TensorFlow Datasets...")
 
     train_dataset = create_tf_dataset(X_train_padded, y_train_padded, batch_size)
     val_dataset = create_tf_dataset(X_val_padded, y_val_padded, batch_size)
@@ -235,8 +318,16 @@ def create_loocv_dataset(
     # Output shape is the sequence length for labels
     output_shape = max_len
 
-    print("\nDataset creation complete.")
-    print(f"  Input Shape for Model: {input_shape}")
-    print(f"  Output Shape (Sequence Length): {output_shape}")
+    logger.info("\nDataset creation complete.")
+    logger.info(f"  Input Shape for Model: {input_shape}")
+    logger.info(f"  Output Shape (Sequence Length): {output_shape}")
 
-    return train_dataset, val_dataset, test_dataset, input_shape, output_shape
+    return (
+        train_dataset,
+        val_dataset,
+        test_dataset,
+        input_shape,
+        output_shape,
+        norm_mean,
+        norm_std,
+    )

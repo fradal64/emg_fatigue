@@ -4,7 +4,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import tensorflow as tf
 from loguru import logger
-from scipy import stats
 
 from emg_fatigue.config import FIGURES_DIR, PADDING_VALUE
 
@@ -14,9 +13,12 @@ def visualize_model_predictions(
     processed_data: Dict[str, Dict[str, List[Dict[str, np.ndarray]]]],
     test_participant_ids: List[str],
     input_shape: Tuple[int, int],
+    norm_mean: Optional[np.ndarray] = None,
+    norm_std: Optional[np.ndarray] = None,
 ) -> None:
     """
     Visualizes model predictions against true labels for each recording in the test set.
+    Applies normalization if mean and std are provided.
 
     Args:
         model: The trained Keras model.
@@ -40,17 +42,22 @@ def visualize_model_predictions(
                        }
         test_participant_ids: List of participant IDs included in the test set.
         input_shape: The input shape tuple (max_len, num_features) returned by dataset creation.
+        norm_mean: Mean array for normalization (from training set). If None, no normalization.
+        norm_std: Standard deviation array for normalization (from training set). If None, no normalization.
     """
     # Extract max_len from input_shape
     max_len = input_shape[0]
 
-    # For collecting slope statistics
-    all_slopes_before_50s = []
-    all_slopes_after_50s = []
-
     logger.info(
         f"Starting prediction visualization for {len(test_participant_ids)} test participants."
     )
+    if norm_mean is not None and norm_std is not None:
+        logger.info(
+            "Normalization statistics provided. Applying normalization to test data."
+        )
+    else:
+        logger.info("No normalization statistics provided. Using raw spectrogram data.")
+
     FIGURES_DIR.mkdir(parents=True, exist_ok=True)
 
     for p_id in test_participant_ids:
@@ -107,10 +114,26 @@ def visualize_model_predictions(
                     continue
 
                 # --- Prepare data for model ---
-                Sxx_transposed = Sxx.T
+                Sxx_transposed = Sxx.T  # Shape: (time_steps, features)
+
+                # Normalize the transposed spectrogram if stats are provided
+                if norm_mean is not None and norm_std is not None:
+                    try:
+                        Sxx_normalized = (Sxx_transposed - norm_mean) / norm_std
+                        logger.debug(
+                            f"  Applied normalization to spectrogram for {p_id} {side} Rec {rec_index + 1}"
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"  Error applying normalization for {p_id} {side} Rec {rec_index + 1}: {e}. Using unnormalized data."
+                        )
+                        Sxx_normalized = Sxx_transposed  # Fallback to unnormalized
+                else:
+                    Sxx_normalized = Sxx_transposed  # Use unnormalized data
 
                 # Pad sequences to match expected input_shape
-                padded_Sxx = pad_sequence(Sxx_transposed, max_len)
+                # Use the (potentially) normalized data for padding
+                padded_Sxx = pad_sequence(Sxx_normalized, max_len)
                 padded_y_true = pad_sequence(y_true, max_len)
                 padded_t_spectrogram = pad_sequence(t_spectrogram, max_len)
 
@@ -150,51 +173,6 @@ def visualize_model_predictions(
                     )
                     continue
 
-                # --- Analyze label slopes ---
-                # Identify indices before and after 50s
-                before_50s = t_valid <= 50
-                after_50s = t_valid > 50
-
-                # If we have data points in both regions
-                slope_before_50s = None
-                slope_after_50s = None
-
-                if np.sum(before_50s) > 1:
-                    # Calculate slope of true labels before 50s
-                    (
-                        slope_before_50s,
-                        intercept_before,
-                        r_value_before,
-                        p_value_before,
-                        std_err_before,
-                    ) = stats.linregress(t_valid[before_50s], y_true_valid[before_50s])
-                    all_slopes_before_50s.append(slope_before_50s)
-
-                if np.sum(after_50s) > 1:
-                    # Calculate slope of true labels after 50s
-                    (
-                        slope_after_50s,
-                        intercept_after,
-                        r_value_after,
-                        p_value_after,
-                        std_err_after,
-                    ) = stats.linregress(t_valid[after_50s], y_true_valid[after_50s])
-                    all_slopes_after_50s.append(slope_after_50s)
-
-                # Calculate slope for predictions
-                pred_slope_before_50s = None
-                pred_slope_after_50s = None
-
-                if np.sum(before_50s) > 1:
-                    pred_slope_before_50s, _, _, _, _ = stats.linregress(
-                        t_valid[before_50s], y_pred_valid[before_50s]
-                    )
-
-                if np.sum(after_50s) > 1:
-                    pred_slope_after_50s, _, _, _, _ = stats.linregress(
-                        t_valid[after_50s], y_pred_valid[after_50s]
-                    )
-
                 # --- Plotting ---
                 fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=False)
                 fig.suptitle(
@@ -218,6 +196,7 @@ def visualize_model_predictions(
                 # Plot 2: Spectrogram (Middle)
                 ax = axes[1]
                 # Calculate dB scale exactly as in visualize_partecipant_data.py
+                # IMPORTANT: Use the ORIGINAL Sxx for plotting, not the normalized one
                 Sxx_db = 10 * np.log10(Sxx + np.finfo(float).eps)
 
                 if len(t_spectrogram) == Sxx.shape[1]:
@@ -259,72 +238,18 @@ def visualize_model_predictions(
                     color="red",
                 )
 
-                # Add vertical marker at 50 seconds
-                if t_min <= 50 <= t_max:
-                    ax.axvline(
-                        x=50, color="green", linestyle="--", alpha=0.7, label="50s mark"
-                    )
-
-                    # Calculate error at 50s mark for annotation
-                    # Find the closest time point to 50s
-                    if len(t_valid) > 0:
-                        idx_50s = np.argmin(np.abs(t_valid - 50))
-                        if idx_50s < len(y_true_valid) and idx_50s < len(y_pred_valid):
-                            true_val_50s = y_true_valid[idx_50s]
-                            pred_val_50s = y_pred_valid[idx_50s]
-                            error_50s = true_val_50s - pred_val_50s
-                            # Add annotation
-                            ax.annotate(
-                                f"Error at 50s: {error_50s:.1f}",
-                                xy=(50, max(true_val_50s, pred_val_50s) + 5),
-                                xytext=(50, max(true_val_50s, pred_val_50s) + 10),
-                                ha="center",
-                                va="bottom",
-                                bbox=dict(
-                                    boxstyle="round,pad=0.5", fc="yellow", alpha=0.3
-                                ),
-                            )
-
-                # Add slope calculations to the plot
-                if slope_before_50s is not None and slope_after_50s is not None:
-                    # Add fit lines for true labels
-                    if np.sum(before_50s) > 1:
-                        # Before 50s
-                        t_before = t_valid[before_50s]
-                        y_before_fit = intercept_before + slope_before_50s * t_before
-                        ax.plot(
-                            t_before,
-                            y_before_fit,
-                            color="blue",
-                            alpha=0.5,
-                            linestyle=":",
-                        )
-
-                    if np.sum(after_50s) > 1:
-                        # After 50s
-                        t_after = t_valid[after_50s]
-                        y_after_fit = intercept_after + slope_after_50s * t_after
-                        ax.plot(
-                            t_after, y_after_fit, color="blue", alpha=0.5, linestyle=":"
-                        )
-
-                    # Add annotations for slopes
-                    text = (
-                        f"True slopes: {slope_before_50s:.2f} (<50s), {slope_after_50s:.2f} (>50s)\n"
-                        f"Pred slopes: {pred_slope_before_50s:.2f} (<50s), {pred_slope_after_50s:.2f} (>50s)"
-                    )
-
-                    # Position the text box in the bottom right of the axis
-                    ax.text(
-                        0.97,
-                        0.05,
-                        text,
-                        transform=ax.transAxes,
-                        fontsize=9,
-                        bbox=dict(facecolor="white", alpha=0.7, edgecolor="gray"),
-                        ha="right",
-                        va="bottom",
-                    )
+                # Calculate mean absolute error for this recording
+                mae = np.mean(np.abs(y_true_valid - y_pred_valid))
+                ax.text(
+                    0.97,
+                    0.05,
+                    f"MAE: {mae:.2f}",
+                    transform=ax.transAxes,
+                    fontsize=10,
+                    bbox=dict(facecolor="white", alpha=0.7, edgecolor="gray"),
+                    ha="right",
+                    va="bottom",
+                )
 
                 ax.set_xlabel("Time (s)")
                 ax.set_ylabel("Fatigue Label")
@@ -347,23 +272,6 @@ def visualize_model_predictions(
                 except Exception as e:
                     logger.error(f"  Failed to save plot {save_path}: {e}")
                 plt.close(fig)
-
-    # Log summary statistics for slopes
-    if all_slopes_before_50s:
-        logger.info(
-            f"True label slopes before 50s: mean={np.mean(all_slopes_before_50s):.4f}, "
-            f"std={np.std(all_slopes_before_50s):.4f}, "
-            f"min={np.min(all_slopes_before_50s):.4f}, "
-            f"max={np.max(all_slopes_before_50s):.4f}"
-        )
-
-    if all_slopes_after_50s:
-        logger.info(
-            f"True label slopes after 50s: mean={np.mean(all_slopes_after_50s):.4f}, "
-            f"std={np.std(all_slopes_after_50s):.4f}, "
-            f"min={np.min(all_slopes_after_50s):.4f}, "
-            f"max={np.max(all_slopes_after_50s):.4f}"
-        )
 
     logger.info("Finished prediction visualization.")
 
