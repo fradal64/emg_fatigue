@@ -10,6 +10,7 @@ from emg_fatigue.config import FIGURES_DIR, PADDING_VALUE
 
 def visualize_model_predictions(
     model: tf.keras.Model,
+    model_name: str,
     processed_data: Dict[str, Dict[str, List[Dict[str, np.ndarray]]]],
     test_participant_ids: List[str],
     input_shape: Tuple[int, int],
@@ -22,6 +23,7 @@ def visualize_model_predictions(
 
     Args:
         model: The trained Keras model.
+        model_name: Name of the model to use in output filenames.
         processed_data: Dictionary containing processed data for all participants.
                        Structure: {
                            'P001': {
@@ -49,7 +51,7 @@ def visualize_model_predictions(
     max_len = input_shape[0]
 
     logger.info(
-        f"Starting prediction visualization for {len(test_participant_ids)} test participants."
+        f"Starting prediction visualization for {len(test_participant_ids)} test participants using model '{model_name}'."
     )
     if norm_mean is not None and norm_std is not None:
         logger.info(
@@ -176,7 +178,7 @@ def visualize_model_predictions(
                 # --- Plotting ---
                 fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=False)
                 fig.suptitle(
-                    f"Participant {p_id} - {side.capitalize()} Side - Recording {rec_index + 1}"
+                    f"Participant {p_id} - {side.capitalize()} Side - Recording {rec_index + 1} - Model: {model_name}"
                 )
 
                 # Determine common time range for all plots
@@ -267,9 +269,9 @@ def visualize_model_predictions(
                 participant_dir = FIGURES_DIR / p_id
                 participant_dir.mkdir(parents=True, exist_ok=True)
 
-                # Save to participant-specific directory with a simpler filename
+                # Save to participant-specific directory with model name in the filename
                 save_path = (
-                    participant_dir / f"predictions_{side}_rec{rec_index + 1}.png"
+                    participant_dir / f"{model_name}_{side}_rec{rec_index + 1}.png"
                 )
                 try:
                     plt.savefig(save_path)
@@ -278,7 +280,7 @@ def visualize_model_predictions(
                     logger.error(f"  Failed to save plot {save_path}: {e}")
                 plt.close(fig)
 
-    logger.info("Finished prediction visualization.")
+    logger.info(f"Finished prediction visualization for model '{model_name}'.")
 
 
 def pad_sequence(sequence: np.ndarray, max_len: int) -> np.ndarray:
