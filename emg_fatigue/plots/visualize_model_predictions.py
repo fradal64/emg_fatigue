@@ -1,11 +1,17 @@
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
+import seaborn as sns
 import tensorflow as tf
 from loguru import logger
 
 from emg_fatigue.config import FIGURES_DIR, PADDING_VALUE
+
+# Set seaborn theme
+sns.set_theme(style="whitegrid")
 
 
 def visualize_model_predictions(
@@ -69,6 +75,15 @@ def visualize_model_predictions(
             continue
 
         logger.info(f"Visualizing predictions for participant {p_id}...")
+
+        # Create a separate folder for each participant's figures
+        participant_dir = FIGURES_DIR / p_id
+        participant_dir.mkdir(parents=True, exist_ok=True)
+
+        # Initialize lists to collect data for overlay plots for the entire participant
+        all_t_valid_participant = []
+        all_y_true_valid_participant = []
+        all_y_pred_valid_participant = []
 
         for side in ["left", "right"]:
             recordings: Optional[List[Dict[str, np.ndarray]]] = participant_dict.get(
@@ -175,7 +190,12 @@ def visualize_model_predictions(
                     )
                     continue
 
-                # --- Plotting ---
+                # --- Store data for participant-level overlay plots, tagged with side ---
+                all_t_valid_participant.append((side, t_valid))
+                all_y_true_valid_participant.append((side, y_true_valid))
+                all_y_pred_valid_participant.append((side, y_pred_valid))
+
+                # --- Plotting Individual Recording with Seaborn ---
                 fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=False)
                 fig.suptitle(
                     f"Participant {p_id} - {side.capitalize()} Side - Recording {rec_index + 1} - Model: {model_name}"
@@ -186,19 +206,16 @@ def visualize_model_predictions(
                 t_min = t_spectrogram.min() if len(t_spectrogram) > 0 else 0
                 t_max = t_spectrogram.max() if len(t_spectrogram) > 0 else 100
 
-                # Plot 1: Raw EMG Signal (Top)
+                # Plot 1: Raw EMG Signal (Top) - Use Seaborn
                 ax = axes[0]
-                ax.plot(t_raw, raw_signal)
+                sns.lineplot(x=t_raw, y=raw_signal, ax=ax)
                 ax.set_ylabel("Amplitude (mV)")
                 ax.set_title("Raw EMG Signal")
                 ax.grid(True)
-                # Set consistent x-axis limits
                 ax.set_xlim(t_min, t_max)
 
-                # Plot 2: Spectrogram (Middle)
+                # Plot 2: Spectrogram (Middle) - Keep pcolormesh
                 ax = axes[1]
-                # Calculate dB scale exactly as in visualize_partecipant_data.py
-                # IMPORTANT: Use the ORIGINAL Sxx for plotting, not the normalized one
                 Sxx_db = 10 * np.log10(Sxx + np.finfo(float).eps)
 
                 if len(t_spectrogram) == Sxx.shape[1]:
@@ -221,23 +238,26 @@ def visualize_model_predictions(
                     ax.set_title("Spectrogram (Time Mismatch)")
                     ax.set_ylabel("Frequency (Hz)")
 
-                # Plot 3: True vs Predicted Labels (Bottom)
+                # Plot 3: True vs Predicted Labels (Bottom) - Use Seaborn
                 ax = axes[2]
-                ax.plot(
-                    t_valid,
-                    y_true_valid,
-                    label="True Fatigue Label",
-                    marker=".",
-                    linestyle="-",
-                    color="blue",
+                # Prepare data for seaborn lineplot (optional but good practice)
+                plot_data = pd.DataFrame(
+                    {
+                        "time": np.concatenate([t_valid, t_valid]),
+                        "fatigue": np.concatenate([y_true_valid, y_pred_valid]),
+                        "type": ["True"] * len(t_valid) + ["Predicted"] * len(t_valid),
+                    }
                 )
-                ax.plot(
-                    t_valid,
-                    y_pred_valid,
-                    label="Predicted Fatigue Label",
-                    marker="x",
-                    linestyle="--",
-                    color="red",
+                sns.lineplot(
+                    data=plot_data,
+                    x="time",
+                    y="fatigue",
+                    hue="type",
+                    style="type",
+                    markers=True,
+                    dashes=False,
+                    ax=ax,
+                    palette=["blue", "red"],
                 )
 
                 # Calculate mean absolute error for this recording
@@ -258,17 +278,12 @@ def visualize_model_predictions(
                 ax.set_title("True vs. Predicted Fatigue Labels")
                 ax.legend()
                 ax.grid(True)
-                # Set consistent x-axis limits
                 ax.set_xlim(t_min, t_max)
 
                 # Adjust layout for better spacing
                 plt.tight_layout(rect=[0, 0.03, 1, 0.95])
 
                 # --- Save figure ---
-                # Create a separate folder for each participant
-                participant_dir = FIGURES_DIR / p_id
-                participant_dir.mkdir(parents=True, exist_ok=True)
-
                 # Save to participant-specific directory with model name in the filename
                 save_path = (
                     participant_dir / f"{model_name}_{side}_rec{rec_index + 1}.png"
@@ -279,6 +294,24 @@ def visualize_model_predictions(
                 except Exception as e:
                     logger.error(f"  Failed to save plot {save_path}: {e}")
                 plt.close(fig)
+
+        # --- Generate and save overlay plots for the PARTICIPANT after processing BOTH sides ---
+        if all_t_valid_participant:  # Check if there's any valid data collected
+            try:
+                plot_overlay_predictions(
+                    all_t_valid_participant,
+                    all_y_true_valid_participant,
+                    all_y_pred_valid_participant,
+                    p_id,  # Pass participant ID
+                    model_name,
+                    participant_dir,  # Pass the participant-specific directory
+                )
+            except Exception as e:
+                logger.error(f"Failed to generate overlay plots for {p_id}: {e}")
+        else:
+            logger.warning(
+                f"No valid data collected for {p_id} to generate overlay plots."
+            )
 
     logger.info(f"Finished prediction visualization for model '{model_name}'.")
 
@@ -311,3 +344,232 @@ def pad_sequence(sequence: np.ndarray, max_len: int) -> np.ndarray:
         return np.pad(
             sequence, pad_width, mode="constant", constant_values=PADDING_VALUE
         )
+
+
+# --- Updated Helper Function for Combined Overlay Plots using Seaborn ---
+def plot_overlay_predictions(
+    all_t_data: List[Tuple[str, np.ndarray]],
+    all_y_true_data: List[Tuple[str, np.ndarray]],
+    all_y_pred_data: List[Tuple[str, np.ndarray]],
+    p_id: str,
+    model_name: str,
+    participant_dir: Path,
+):
+    """
+    Generates combined overlay plots for true vs predicted fatigue labels across all
+    recordings (both sides) for a participant using Seaborn.
+    Creates two plots: one with absolute time and one with normalized time (0-100%).
+    """
+    if not all_t_data:
+        logger.warning(
+            f"No valid data provided for overlay plots for {p_id}. Skipping."
+        )
+        return
+
+    logger.info(f"Generating combined overlay plots for participant {p_id}...")
+
+    # --- Calculate Overall MAE (across all recordings, both sides) ---
+    # Extract only the label arrays for concatenation
+    y_true_combined = np.concatenate([arr for _, arr in all_y_true_data])
+    y_pred_combined = np.concatenate([arr for _, arr in all_y_pred_data])
+    if len(y_true_combined) > 0:
+        overall_mae = np.mean(np.abs(y_true_combined - y_pred_combined))
+        mae_text = f"Overall MAE: {overall_mae:.2f}"
+    else:
+        overall_mae = np.nan
+        mae_text = "Overall MAE: N/A"
+
+    # --- Prepare DataFrames for Seaborn --- #
+    abs_plot_data_list = []
+    norm_plot_data_list = []
+
+    for i, ((side_t, t_valid), (_, y_true_valid), (_, y_pred_valid)) in enumerate(
+        zip(all_t_data, all_y_true_data, all_y_pred_data)
+    ):
+        rec_id = f"{side_t}_{i}"
+        # Absolute time data
+        abs_plot_data_list.append(
+            pd.DataFrame(
+                {
+                    "time": t_valid,
+                    "fatigue": y_true_valid,
+                    "type": "True",
+                    "recording_id": rec_id,
+                }
+            )
+        )
+        abs_plot_data_list.append(
+            pd.DataFrame(
+                {
+                    "time": t_valid,
+                    "fatigue": y_pred_valid,
+                    "type": "Predicted",
+                    "recording_id": rec_id,
+                }
+            )
+        )
+
+        # Normalized time data
+        t_min, t_max = t_valid.min(), t_valid.max()
+        t_range = t_max - t_min
+        if t_range > np.finfo(float).eps:
+            t_norm = (t_valid - t_min) / t_range * 100.0
+        elif len(t_valid) > 0:
+            t_norm = np.zeros_like(t_valid) + 50.0
+        else:
+            t_norm = t_valid
+
+        norm_plot_data_list.append(
+            pd.DataFrame(
+                {
+                    "normalized_time": t_norm,
+                    "fatigue": y_true_valid,
+                    "type": "True",
+                    "recording_id": rec_id,
+                }
+            )
+        )
+        norm_plot_data_list.append(
+            pd.DataFrame(
+                {
+                    "normalized_time": t_norm,
+                    "fatigue": y_pred_valid,
+                    "type": "Predicted",
+                    "recording_id": rec_id,
+                }
+            )
+        )
+
+    df_abs = (
+        pd.concat(abs_plot_data_list, ignore_index=True)
+        if abs_plot_data_list
+        else pd.DataFrame()
+    )
+    df_norm = (
+        pd.concat(norm_plot_data_list, ignore_index=True)
+        if norm_plot_data_list
+        else pd.DataFrame()
+    )
+
+    # --- Plot 1: Absolute Time Overlay (Seaborn) ---
+    if not df_abs.empty:
+        fig_abs, ax_abs = plt.subplots(1, 1, figsize=(12, 6))
+        fig_abs.suptitle(
+            f"Participant {p_id} - All Recordings Overlay (Absolute Time) - Model: {model_name}"
+        )
+
+        sns.lineplot(
+            data=df_abs,
+            x="time",
+            y="fatigue",
+            hue="type",  # Color by True/Predicted
+            units="recording_id",  # Draw separate lines per recording
+            estimator=None,  # Plot actual lines, not aggregates
+            alpha=0.6,
+            palette=["blue", "red"],  # Consistent colors
+            ax=ax_abs,
+        )
+
+        ax_abs.set_xlabel("Time (s)")
+        ax_abs.set_ylabel("Fatigue Label")
+        ax_abs.set_title("Overlay of True vs. Predicted Fatigue Labels")
+        ax_abs.text(
+            0.97,
+            0.05,
+            mae_text,
+            transform=ax_abs.transAxes,
+            fontsize=10,
+            bbox=dict(facecolor="white", alpha=0.7, edgecolor="gray"),
+            ha="right",
+            va="bottom",
+        )
+        ax_abs.grid(True)
+        # Improve legend if needed (Seaborn usually does a good job)
+        handles, labels = ax_abs.get_legend_handles_labels()
+        # Filter unique labels (Seaborn might duplicate based on units)
+        unique_labels = {}
+        for handle, label in zip(handles, labels):
+            if label not in unique_labels and label in ["True", "Predicted"]:
+                unique_labels[label] = handle
+        if unique_labels:
+            ax_abs.legend(
+                unique_labels.values(), unique_labels.keys(), title="Label Type"
+            )
+        else:
+            ax_abs.legend().set_visible(False)  # Hide legend if empty
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+        save_path_abs = participant_dir / f"{model_name}_overlay_absolute_time.png"
+        try:
+            plt.savefig(save_path_abs)
+            logger.info(f"  Saved absolute time overlay plot to: {save_path_abs}")
+        except Exception as e:
+            logger.error(f"  Failed to save plot {save_path_abs}: {e}")
+        plt.close(fig_abs)
+    else:
+        logger.warning(f"No data for absolute time overlay plot for {p_id}.")
+
+    # --- Plot 2: Normalized Time Overlay (Seaborn) ---
+    if not df_norm.empty:
+        fig_norm, ax_norm = plt.subplots(1, 1, figsize=(12, 6))
+        fig_norm.suptitle(
+            f"Participant {p_id} - All Recordings Overlay (Normalized Time) - Model: {model_name}"
+        )
+
+        sns.lineplot(
+            data=df_norm,
+            x="normalized_time",
+            y="fatigue",
+            hue="type",
+            units="recording_id",
+            estimator=None,
+            alpha=0.6,
+            palette=["blue", "red"],
+            ax=ax_norm,
+        )
+
+        ax_norm.set_xlabel("Normalized Recording Time (%)")
+        ax_norm.set_ylabel("Fatigue Label")
+        ax_norm.set_title(
+            "Overlay of True vs. Predicted Fatigue Labels (Normalized Time)"
+        )
+        ax_norm.text(
+            0.97,
+            0.05,
+            mae_text,
+            transform=ax_norm.transAxes,
+            fontsize=10,
+            bbox=dict(facecolor="white", alpha=0.7, edgecolor="gray"),
+            ha="right",
+            va="bottom",
+        )
+        ax_norm.grid(True)
+        ax_norm.set_xlim(0, 100)
+
+        # Improve legend (similar to absolute plot)
+        handles_norm, labels_norm = ax_norm.get_legend_handles_labels()
+        unique_labels_norm = {}
+        for handle, label in zip(handles_norm, labels_norm):
+            if label not in unique_labels_norm and label in ["True", "Predicted"]:
+                unique_labels_norm[label] = handle
+        if unique_labels_norm:
+            ax_norm.legend(
+                unique_labels_norm.values(),
+                unique_labels_norm.keys(),
+                title="Label Type",
+            )
+        else:
+            ax_norm.legend().set_visible(False)
+
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+
+        save_path_norm = participant_dir / f"{model_name}_overlay_normalized_time.png"
+        try:
+            plt.savefig(save_path_norm)
+            logger.info(f"  Saved normalized time overlay plot to: {save_path_norm}")
+        except Exception as e:
+            logger.error(f"  Failed to save plot {save_path_norm}: {e}")
+        plt.close(fig_norm)
+    else:
+        logger.warning(f"No data for normalized time overlay plot for {p_id}.")

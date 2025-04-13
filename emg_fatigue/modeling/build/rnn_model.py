@@ -39,6 +39,7 @@ def build_lstm_model(
         ValueError: If test_id list contains more than one ID.
     """
     # --- Construct model name ---
+    # Test ID is included to distinguish between models trained on different test sets when saved as .keras files.
 
     if len(test_id) > 1:
         raise ValueError(

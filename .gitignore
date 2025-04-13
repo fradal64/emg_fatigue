@@ -1,6 +1,9 @@
 # Data
 /data/
 
+# Figures
+/reports/figures/
+
 # Mac OS-specific storage files
 .DS_Store
 
@@ -20,7 +23,7 @@ __pycache__/
 
 # Distribution / packaging
 .Python
-build/
+
 develop-eggs/
 dist/
 downloads/
