@@ -7,6 +7,7 @@ import pandas as pd
 import seaborn as sns
 import tensorflow as tf
 from loguru import logger
+from matplotlib.ticker import MaxNLocator
 
 from emg_fatigue.config import FIGURES_DIR, PADDING_VALUE
 
@@ -22,10 +23,14 @@ def visualize_model_predictions(
     input_shape: Tuple[int, int],
     norm_mean: Optional[np.ndarray] = None,
     norm_std: Optional[np.ndarray] = None,
+    test_recording_indices: Optional[Dict[str, Dict[str, List[int]]]] = None,
+    num_thumbnails: int = 20,
 ) -> None:
     """
     Visualizes model predictions against true labels for each recording in the test set.
     Applies normalization if mean and std are provided.
+    If test_recording_indices is provided, only visualizes recordings with indices in that list.
+    Uses a top plot for fatigue labels and a bottom row of spectrogram thumbnails.
 
     Args:
         model: The trained Keras model.
@@ -52,6 +57,9 @@ def visualize_model_predictions(
         input_shape: The input shape tuple (max_len, num_features) returned by dataset creation.
         norm_mean: Mean array for normalization (from training set). If None, no normalization.
         norm_std: Standard deviation array for normalization (from training set). If None, no normalization.
+        test_recording_indices: Optional dictionary mapping participant ID and side to a list of
+                                original recording indices to visualize. If None, visualize all.
+        num_thumbnails: Number of spectrogram thumbnails to display below the main plot.
     """
     # Extract max_len from input_shape
     max_len = input_shape[0]
@@ -96,10 +104,33 @@ def visualize_model_predictions(
                 )
                 continue
 
+            # Determine which recording indices to process for this side
+            allowed_indices = None
+            if (
+                test_recording_indices
+                and p_id in test_recording_indices
+                and side in test_recording_indices[p_id]
+            ):
+                allowed_indices = set(test_recording_indices[p_id][side])
+                logger.info(
+                    f"  Visualizing specific indices for {p_id}/{side}: {sorted(list(allowed_indices))}"
+                )
+            else:
+                logger.info(
+                    f"  Visualizing all found recordings for {p_id}/{side} (no specific indices provided)."
+                )
+
+            num_processed = 0
             for rec_index, recording in enumerate(recordings):
+                # --- Filter recordings based on test_recording_indices ---
+                if allowed_indices is not None and rec_index not in allowed_indices:
+                    # logger.debug(f"  Skipping recording {rec_index + 1} for {p_id} {side} (not in test_recording_indices).")
+                    continue  # Skip this recording if it's not in the allowed list
+
                 logger.info(
                     f"  Processing recording {rec_index + 1}/{len(recordings)} for {p_id} {side}..."
                 )
+                num_processed += 1
 
                 # Extract data for the current recording
                 Sxx = recording.get("spectrogram")
@@ -195,96 +226,195 @@ def visualize_model_predictions(
                 all_y_true_valid_participant.append((side, y_true_valid))
                 all_y_pred_valid_participant.append((side, y_pred_valid))
 
-                # --- Plotting Individual Recording with Seaborn ---
-                fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=False)
-                fig.suptitle(
-                    f"Participant {p_id} - {side.capitalize()} Side - Recording {rec_index + 1} - Model: {model_name}"
+                # --- Plotting: Scatter Labels (Top) + 1D Frequency Profiles (Bottom) + Time Axis ---
+                fig = plt.figure(figsize=(15, 6.5))  # Slightly taller for bottom axis
+                # Add extra row for the time axis, adjust height ratios
+                gs = fig.add_gridspec(
+                    3,
+                    num_thumbnails,
+                    height_ratios=[
+                        10,
+                        10,
+                        1,
+                    ],  # Give labels/profiles more space, time axis less
+                    width_ratios=[1] * num_thumbnails,
                 )
 
-                # Determine common time range for all plots
-                # Using the spectrogram time vector as the reference
-                t_min = t_spectrogram.min() if len(t_spectrogram) > 0 else 0
-                t_max = t_spectrogram.max() if len(t_spectrogram) > 0 else 100
+                ax_labels = fig.add_subplot(gs[0, :])  # Top row for scatter plot
+                fig.suptitle(
+                    f"Participant {p_id} - {side.capitalize()} Side - Rec {rec_index + 1} - Model: {model_name}"
+                )
 
-                # Plot 1: Raw EMG Signal (Top) - Use Seaborn
-                ax = axes[0]
-                sns.lineplot(x=t_raw, y=raw_signal, ax=ax)
-                ax.set_ylabel("Amplitude (mV)")
-                ax.set_title("Raw EMG Signal")
-                ax.grid(True)
-                ax.set_xlim(t_min, t_max)
-
-                # Plot 2: Spectrogram (Middle) - Keep pcolormesh
-                ax = axes[1]
+                # --- Data Preparation for Point-in-Time Plots ---
                 Sxx_db = 10 * np.log10(Sxx + np.finfo(float).eps)
+                target_times = np.linspace(
+                    t_spectrogram.min(), t_spectrogram.max(), num_thumbnails
+                )
 
-                if len(t_spectrogram) == Sxx.shape[1]:
-                    pcm = ax.pcolormesh(
-                        t_spectrogram,  # Use spectrogram time vector
-                        f,
-                        Sxx_db,
-                        shading="gouraud",
-                        cmap="viridis",
-                    )
-                    fig.colorbar(pcm, ax=ax, label="Power/Frequency (dB/Hz)")
-                    ax.set_ylabel("Frequency (Hz)")
-                    ax.set_title("Spectrogram (Log Scale)")
-                    # Set consistent x-axis limits
-                    ax.set_xlim(t_min, t_max)
-                else:
+                plot_data_points = []  # List to store tuples: (t_val, y_true, y_pred, profile, spec_time)
+
+                # Find closest indices and gather data
+                for t_target in target_times:
+                    spec_idx = np.argmin(np.abs(t_spectrogram - t_target))
+                    actual_spec_time = t_spectrogram[spec_idx]
+                    profile = Sxx_db[:, spec_idx]
+
+                    # Find the closest index in t_valid (non-padded label time)
+                    if len(t_valid) > 0:
+                        valid_idx = np.argmin(np.abs(t_valid - actual_spec_time))
+                        actual_valid_time = t_valid[valid_idx]
+                        # Check if the closest valid time is reasonably close to the target spec time
+                        if (
+                            np.abs(actual_valid_time - actual_spec_time)
+                            < (t_spectrogram[1] - t_spectrogram[0]) * 2
+                        ):  # Heuristic: within 2 spectrogram time steps
+                            plot_data_points.append(
+                                (
+                                    actual_valid_time,
+                                    y_true_valid[valid_idx],
+                                    y_pred_valid[valid_idx],
+                                    profile,
+                                    actual_spec_time,
+                                )
+                            )
+                    else:
+                        logger.warning(
+                            f"Skipping target time {t_target:.2f}s as t_valid is empty."
+                        )
+
+                if not plot_data_points:
                     logger.warning(
-                        f"  Spectrogram time vector length ({len(t_spectrogram)}) mismatch with Sxx columns ({Sxx.shape[1]}) for {p_id} {side} Rec {rec_index + 1}. Skipping spectrogram plot."
+                        f"No valid data points found for plotting for {p_id} {side} Rec {rec_index + 1}. Skipping plot."
                     )
-                    ax.set_title("Spectrogram (Time Mismatch)")
-                    ax.set_ylabel("Frequency (Hz)")
+                    plt.close(fig)
+                    continue
 
-                # Plot 3: True vs Predicted Labels (Bottom) - Use Seaborn
-                ax = axes[2]
-                # Prepare data for seaborn lineplot (optional but good practice)
-                plot_data = pd.DataFrame(
+                # Unzip the collected data
+                plot_t, plot_y_true, plot_y_pred, plot_profiles, plot_spec_times = zip(
+                    *plot_data_points
+                )
+                plot_t = np.array(plot_t)
+                plot_y_true = np.array(plot_y_true)
+                plot_y_pred = np.array(plot_y_pred)
+
+                # --- Top Plot: Scatter plot of Labels at specific times ---
+                scatter_df = pd.DataFrame(
                     {
-                        "time": np.concatenate([t_valid, t_valid]),
-                        "fatigue": np.concatenate([y_true_valid, y_pred_valid]),
-                        "type": ["True"] * len(t_valid) + ["Predicted"] * len(t_valid),
+                        "Time (s)": np.concatenate([plot_t, plot_t]),
+                        "Fatigue Progression (%)": np.concatenate(
+                            [plot_y_true, plot_y_pred]
+                        ),
+                        "Label Type": ["True"] * len(plot_t)
+                        + ["Predicted"] * len(plot_t),
                     }
                 )
-                sns.lineplot(
-                    data=plot_data,
-                    x="time",
-                    y="fatigue",
-                    hue="type",
-                    style="type",
-                    markers=True,
-                    dashes=False,
-                    ax=ax,
-                    palette=["blue", "red"],
+
+                sns.scatterplot(
+                    data=scatter_df,
+                    x="Time (s)",
+                    y="Fatigue Progression (%)",
+                    hue="Label Type",
+                    style="Label Type",
+                    s=80,  # Increase marker size
+                    ax=ax_labels,
+                )
+                ax_labels.set_ylabel("Fatigue Progression (%)", fontsize=10)
+                ax_labels.grid(True, linestyle=":")
+                ax_labels.legend(loc="upper left", fontsize=10)
+                ax_labels.set_ylim(-5, 105)
+
+                # --- Align Top Plot & FORCE remove its x-axis elements ---
+                # Set x-ticks and limits to precisely match the thumbnail times
+                ax_labels.set_xticks(plot_t)
+                # Explicitly remove labels and ticks AFTER plotting
+                ax_labels.set_xticklabels([])
+                ax_labels.tick_params(
+                    axis="x", labelbottom=False, bottom=False, length=0
+                )
+                ax_labels.set_xlabel("")  # Force remove xlabel
+
+                if len(plot_t) > 0:
+                    # Calculate limits based on thumbnail spacing for better visual centering
+                    if len(plot_t) > 1:
+                        time_step = plot_t[1] - plot_t[0]
+                        lim_min = plot_t[0] - time_step / 2
+                        lim_max = plot_t[-1] + time_step / 2
+                    else:
+                        time_step = 5  # Default spacing if only one point
+                        lim_min = plot_t[0] - time_step / 2
+                        lim_max = plot_t[0] + time_step / 2
+                    ax_labels.set_xlim(lim_min, lim_max)
+                else:
+                    ax_labels.set_xlim(0, 1)  # Default if no points
+
+                # --- Middle Row: 1D Frequency Profiles ---
+                all_profiles = np.array(plot_profiles)
+                power_min = (
+                    np.percentile(all_profiles, 1) if all_profiles.size > 0 else 0
+                )
+                power_max = (
+                    np.percentile(all_profiles, 99) if all_profiles.size > 0 else 1
                 )
 
-                # Calculate mean absolute error for this recording
-                mae = np.mean(np.abs(y_true_valid - y_pred_valid))
-                ax.text(
-                    0.97,
-                    0.05,
-                    f"MAE: {mae:.2f}",
-                    transform=ax.transAxes,
-                    fontsize=10,
-                    bbox=dict(facecolor="white", alpha=0.7, edgecolor="gray"),
-                    ha="right",
-                    va="bottom",
-                )
+                thumbnail_axes = []  # Store axes for later use
+                for i, (profile, spec_time) in enumerate(
+                    zip(plot_profiles, plot_spec_times)
+                ):
+                    ax_thumb = fig.add_subplot(gs[1, i])  # Use middle row (index 1)
+                    thumbnail_axes.append(ax_thumb)
+                    ax_thumb.plot(profile, f)  # Power on X, Frequency on Y
 
-                ax.set_xlabel("Time (s)")
-                ax.set_ylabel("Fatigue Label")
-                ax.set_title("True vs. Predicted Fatigue Labels")
-                ax.legend()
-                ax.grid(True)
-                ax.set_xlim(t_min, t_max)
+                    ax_thumb.set_xlim(power_min, power_max)  # Shared power axis
+                    ax_thumb.set_ylim(f.min(), f.max())
+                    ax_thumb.set_title("")  # Remove time from title
 
-                # Adjust layout for better spacing
-                plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+                    if i == 0:
+                        ax_thumb.set_ylabel("Freq (Hz)", fontsize=9)
+                        ax_thumb.tick_params(axis="y", labelsize=8)
+                    else:
+                        ax_thumb.set_yticks([])
+                        ax_thumb.set_yticklabels([])
+
+                    # Show power ticks on all thumbnails
+                    ax_thumb.xaxis.set_major_locator(
+                        MaxNLocator(nbins=3, prune="both")
+                    )  # Limit ticks
+                    ax_thumb.tick_params(axis="x", labelsize=8)
+                    ax_thumb.set_xlabel("")  # Ensure individual xlabel is cleared
+
+                    # Set xlabel ONLY on the first plot
+                    if i == 0:
+                        ax_thumb.set_xlabel(
+                            "Power (dB)", fontsize=9
+                        )  # Add label to first plot
+
+                    ax_thumb.grid(True, linestyle=":", alpha=0.5)
+
+                # --- Bottom Row: Time Axis ---
+                ax_time = fig.add_subplot(gs[2, :])  # Use bottom row (index 2)
+                ax_time.set_xlim(
+                    ax_labels.get_xlim()
+                )  # Match limits with the label plot
+                ax_time.set_xticks(plot_t)  # Set ticks to the exact times
+                ax_time.set_xticklabels([f"{t:.1f}s" for t in plot_t], fontsize=9)
+                ax_time.set_xlabel(
+                    "Time (s)", fontsize=10, labelpad=15
+                )  # Increase fontsize for Time label & add padding
+                ax_time.set_yticks([])  # No y-ticks needed
+
+                # Keep only bottom spine for a line effect
+                ax_time.spines["top"].set_visible(False)
+                ax_time.spines["left"].set_visible(False)
+                ax_time.spines["right"].set_visible(False)
+                ax_time.spines["bottom"].set_linewidth(1.0)  # Standard line width
+
+                ax_time.tick_params(axis="x", length=4)
+
+                # --- Layout Adjustments ---
+                plt.tight_layout(rect=[0, 0.03, 1, 0.92])
+                fig.subplots_adjust(hspace=0.6, wspace=0.2)  # Adjust hspace if needed
 
                 # --- Save figure ---
-                # Save to participant-specific directory with model name in the filename
                 save_path = (
                     participant_dir / f"{model_name}_{side}_rec{rec_index + 1}.png"
                 )
@@ -367,17 +497,6 @@ def plot_overlay_predictions(
         return
 
     logger.info(f"Generating combined overlay plots for participant {p_id}...")
-
-    # --- Calculate Overall MAE (across all recordings, both sides) ---
-    # Extract only the label arrays for concatenation
-    y_true_combined = np.concatenate([arr for _, arr in all_y_true_data])
-    y_pred_combined = np.concatenate([arr for _, arr in all_y_pred_data])
-    if len(y_true_combined) > 0:
-        overall_mae = np.mean(np.abs(y_true_combined - y_pred_combined))
-        mae_text = f"Overall MAE: {overall_mae:.2f}"
-    else:
-        overall_mae = np.nan
-        mae_text = "Overall MAE: N/A"
 
     # --- Prepare DataFrames for Seaborn --- #
     abs_plot_data_list = []
@@ -466,23 +585,14 @@ def plot_overlay_predictions(
             units="recording_id",  # Draw separate lines per recording
             estimator=None,  # Plot actual lines, not aggregates
             alpha=0.6,
-            palette=["blue", "red"],  # Consistent colors
             ax=ax_abs,
         )
 
-        ax_abs.set_xlabel("Time (s)")
-        ax_abs.set_ylabel("Fatigue Label")
-        ax_abs.set_title("Overlay of True vs. Predicted Fatigue Labels")
-        ax_abs.text(
-            0.97,
-            0.05,
-            mae_text,
-            transform=ax_abs.transAxes,
-            fontsize=10,
-            bbox=dict(facecolor="white", alpha=0.7, edgecolor="gray"),
-            ha="right",
-            va="bottom",
+        ax_abs.set_xlabel(
+            "Time (s)",
         )
+        ax_abs.set_ylabel("Fatigue Progression (%)")
+        ax_abs.set_title("Overlay of True vs. Predicted Fatigue Labels")
         ax_abs.grid(True)
         # Improve legend if needed (Seaborn usually does a good job)
         handles, labels = ax_abs.get_legend_handles_labels()
@@ -493,7 +603,9 @@ def plot_overlay_predictions(
                 unique_labels[label] = handle
         if unique_labels:
             ax_abs.legend(
-                unique_labels.values(), unique_labels.keys(), title="Label Type"
+                unique_labels.values(),
+                unique_labels.keys(),
+                fontsize=10,
             )
         else:
             ax_abs.legend().set_visible(False)  # Hide legend if empty
@@ -525,24 +637,13 @@ def plot_overlay_predictions(
             units="recording_id",
             estimator=None,
             alpha=0.6,
-            palette=["blue", "red"],
             ax=ax_norm,
         )
 
-        ax_norm.set_xlabel("Normalized Recording Time (%)")
-        ax_norm.set_ylabel("Fatigue Label")
+        ax_norm.set_xlabel("Time (% of task duration)")
+        ax_norm.set_ylabel("Fatigue Progression (%)")
         ax_norm.set_title(
             "Overlay of True vs. Predicted Fatigue Labels (Normalized Time)"
-        )
-        ax_norm.text(
-            0.97,
-            0.05,
-            mae_text,
-            transform=ax_norm.transAxes,
-            fontsize=10,
-            bbox=dict(facecolor="white", alpha=0.7, edgecolor="gray"),
-            ha="right",
-            va="bottom",
         )
         ax_norm.grid(True)
         ax_norm.set_xlim(0, 100)
@@ -557,7 +658,7 @@ def plot_overlay_predictions(
             ax_norm.legend(
                 unique_labels_norm.values(),
                 unique_labels_norm.keys(),
-                title="Label Type",
+                fontsize=10,
             )
         else:
             ax_norm.legend().set_visible(False)

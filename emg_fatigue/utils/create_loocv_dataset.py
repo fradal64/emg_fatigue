@@ -106,7 +106,10 @@ def create_loocv_dataset(
     freq_param: int = 10,
     freq_masks: int = 1,
     augmentation_factor: int = 1,
+    num_fine_tuning_recordings_per_subject: int = 0,
 ) -> Tuple[
+    Optional[tf.data.Dataset],
+    Optional[tf.data.Dataset],
     Optional[tf.data.Dataset],
     Optional[tf.data.Dataset],
     Optional[tf.data.Dataset],
@@ -114,6 +117,7 @@ def create_loocv_dataset(
     Optional[int],
     Optional[np.ndarray],
     Optional[np.ndarray],
+    Optional[Dict[str, Dict[str, List[int]]]],
 ]:
     """
     Creates TensorFlow datasets suitable for training an RNN using spectrograms and fatigue labels.
@@ -122,8 +126,9 @@ def create_loocv_dataset(
     structure but allows specifying multiple validation/test participants.
 
     Optionally applies optional normalization based on training data and padding for variable lengths.
-
     Optionally applies SpecAugment (time and frequency masking) data augmentation on training data.
+    Optionally splits test participant data for fine-tuning before final testing,
+    creating dedicated training and validation sets for the fine-tuning phase.
 
     Args:
         processed_data: Dictionary containing processed EMG data, including 'spectrogram' and 'labels'.
@@ -140,20 +145,40 @@ def create_loocv_dataset(
         freq_param: Maximum number of frequency channels to mask for SpecAugment.
         freq_masks: Number of frequency masks to apply.
         augmentation_factor: Number of augmented copies to create for each original spectrogram.
+        num_fine_tuning_recordings_per_subject: Number of recordings per test subject/side
+            to reserve for fine-tuning. If > 1, the last of these N becomes the
+            fine-tuning validation set. If 0 or 1, no fine-tuning validation set is created.
 
     Returns:
         A tuple containing:
-        - train_dataset: tf.data.Dataset for training (or None if no training data).
-        - val_dataset: tf.data.Dataset for validation (or None if no validation data).
-        - test_dataset: tf.data.Dataset for testing (or None if no test data).
+        - train_dataset: tf.data.Dataset for training.
+        - val_dataset: tf.data.Dataset for validation.
+        - fine_tune_train_dataset: tf.data.Dataset for fine-tuning training (None if N=0).
+        - fine_tune_val_dataset: tf.data.Dataset for fine-tuning validation (None if N<=1).
+        - test_dataset: tf.data.Dataset for testing.
         - input_shape: Tuple (max_sequence_length, num_features) for model input.
         - output_shape: Integer (max_sequence_length) for model output.
         - norm_mean: Mean calculated from training spectrograms (or None).
         - norm_std: Standard deviation calculated from training spectrograms (or None).
-        Returns (None, None, None, None, None, None, None) if no data is processed.
+        - test_recording_indices: Dict mapping test participant ID and side to the list of
+                                  original recording indices used in the final test set.
+        Returns (None, None, None, None, None, None, None, None, None, None) if no data is processed.
     """
-    specs_by_set = {"train": [], "val": [], "test": []}
-    labels_by_set = {"train": [], "val": [], "test": []}
+    specs_by_set = {
+        "train": [],
+        "val": [],
+        "fine_tune_train": [],
+        "fine_tune_val": [],
+        "test": [],
+    }
+    labels_by_set = {
+        "train": [],
+        "val": [],
+        "fine_tune_train": [],
+        "fine_tune_val": [],
+        "test": [],
+    }
+    test_recording_indices: Dict[str, Dict[str, List[int]]] = {}
     max_len = 0
     num_features = None
     norm_mean = None
@@ -176,18 +201,20 @@ def create_loocv_dataset(
                     f"    Warning: Participant {p_id} not found in processed_data. Skipping."
                 )
                 continue
+            if p_id not in test_recording_indices:
+                test_recording_indices[p_id] = {"left": [], "right": []}
+
+            all_participant_recordings = {"left": [], "right": []}
+
             for side in ["left", "right"]:
                 if side not in processed_data[p_id]:
-                    # logger.debug(f"    Debug: Side {side} not found for participant {p_id}.") # Optional debug
                     continue
                 if not processed_data[p_id][side]:
-                    # logger.debug(f"    Debug: No recordings for {p_id} side {side}.") # Optional debug
                     continue
 
+                # Collect all recordings for this participant/side first
                 for recording_idx, recording in enumerate(processed_data[p_id][side]):
-                    # Spectrogram Sxx: shape (freq_bins, time_steps)
                     spectrogram = recording.get("spectrogram")
-                    # Labels: shape (time_steps,)
                     labels = recording.get("labels")
 
                     if spectrogram is None or labels is None:
@@ -196,7 +223,6 @@ def create_loocv_dataset(
                         )
                         continue
 
-                    # Validate shapes: Spectrogram time dimension should match labels length
                     if spectrogram.shape[1] != len(labels):
                         logger.warning(
                             f"    Warning: Shape mismatch for {p_id}/{side}/Rec{recording_idx}. "
@@ -204,31 +230,106 @@ def create_loocv_dataset(
                         )
                         continue
 
-                    # Transpose spectrogram: (freq_bins, time_steps) -> (time_steps, freq_bins)
                     transposed_spec = spectrogram.T
                     current_len = transposed_spec.shape[0]
                     current_feats = transposed_spec.shape[1]
 
-                    # Determine num_features from the first valid recording
                     if num_features is None:
                         num_features = current_feats
-                    # Ensure consistency
                     elif num_features != current_feats:
                         raise ValueError(
                             f"Inconsistent number of frequency bins found! "
                             f"Expected {num_features}, got {current_feats} for {p_id}/{side}/Rec{recording_idx}."
                         )
 
-                    max_len = max(
-                        max_len, current_len
-                    )  # Update max length across all data
+                    max_len = max(max_len, current_len)
 
-                    specs_by_set[set_name].append(transposed_spec)
-                    labels_by_set[set_name].append(labels)
+                    # Store recordings temporarily with original index
+                    all_participant_recordings[side].append(
+                        {
+                            "spec": transposed_spec,
+                            "labels": labels,
+                            "original_idx": recording_idx,
+                        }
+                    )
+
+            # Now assign recordings to the correct set (train, val, or split test/fine-tune)
+            for side in ["left", "right"]:
+                recordings_for_side = all_participant_recordings[side]
+                num_recordings = len(recordings_for_side)
+                N = num_fine_tuning_recordings_per_subject
+
+                if set_name == "test" and N > 0:
+                    if num_recordings < N:
+                        logger.warning(
+                            f"    Warning: Participant {p_id}/{side} has only {num_recordings} recordings, "
+                            f"less than the requested {N} for fine-tuning. "
+                            f"Using all {num_recordings} for fine-tune training, none for fine-tune val or test."
+                        )
+                        fine_tune_train_recs = recordings_for_side
+                        fine_tune_val_recs = []
+                        test_recs = []
+                        split_desc = (
+                            f"{len(fine_tune_train_recs)} FT-train, 0 FT-val, 0 test"
+                        )
+                    elif num_recordings == N:
+                        if N > 1:
+                            fine_tune_train_recs = recordings_for_side[: N - 1]
+                            fine_tune_val_recs = [recordings_for_side[N - 1]]
+                            test_recs = []
+                            split_desc = f"{len(fine_tune_train_recs)} FT-train, 1 FT-val, 0 test"
+                        else:  # N == 1
+                            fine_tune_train_recs = recordings_for_side
+                            fine_tune_val_recs = []
+                            test_recs = []
+                            split_desc = "1 FT-train, 0 FT-val, 0 test"
+                    else:  # num_recordings > N
+                        if N > 1:
+                            fine_tune_train_recs = recordings_for_side[: N - 1]
+                            fine_tune_val_recs = [recordings_for_side[N - 1]]
+                            test_recs = recordings_for_side[N:]
+                            split_desc = f"{len(fine_tune_train_recs)} FT-train, 1 FT-val, {len(test_recs)} test"
+                        else:  # N == 1
+                            fine_tune_train_recs = [recordings_for_side[0]]
+                            fine_tune_val_recs = []
+                            test_recs = recordings_for_side[1:]
+                            split_desc = f"1 FT-train, 0 FT-val, {len(test_recs)} test"
+
+                    logger.info(f"    Splitting {p_id}/{side}: {split_desc}")
+
+                    # Add to fine-tuning train set
+                    for rec in fine_tune_train_recs:
+                        specs_by_set["fine_tune_train"].append(rec["spec"])
+                        labels_by_set["fine_tune_train"].append(rec["labels"])
+
+                    # Add to fine-tuning val set
+                    for rec in fine_tune_val_recs:
+                        specs_by_set["fine_tune_val"].append(rec["spec"])
+                        labels_by_set["fine_tune_val"].append(rec["labels"])
+
+                    # Add to test set and store indices
+                    current_test_indices = []
+                    for rec in test_recs:
+                        specs_by_set["test"].append(rec["spec"])
+                        labels_by_set["test"].append(rec["labels"])
+                        current_test_indices.append(rec["original_idx"])
+                    test_recording_indices[p_id][side] = sorted(current_test_indices)
+
+                else:  # Assign all to the original set (train, val, or test if no fine-tuning)
+                    current_test_indices = []
+                    for rec in recordings_for_side:
+                        specs_by_set[set_name].append(rec["spec"])
+                        labels_by_set[set_name].append(rec["labels"])
+                        if set_name == "test":
+                            current_test_indices.append(rec["original_idx"])
+                    if set_name == "test":
+                        test_recording_indices[p_id][side] = sorted(
+                            current_test_indices
+                        )
 
     if num_features is None or max_len == 0:
         logger.error("Error: No valid data found to create datasets.")
-        return None, None, None, None, None, None, None
+        return None, None, None, None, None, None, None, None, None, None
 
     logger.info(f"\nFound {num_features} frequency bins (features).")
     logger.info(f"Maximum sequence length across all sets: {max_len}.")
@@ -250,6 +351,12 @@ def create_loocv_dataset(
             )
             specs_by_set["val"] = normalize_data(
                 specs_by_set["val"], norm_mean, norm_std
+            )
+            specs_by_set["fine_tune_train"] = normalize_data(
+                specs_by_set["fine_tune_train"], norm_mean, norm_std
+            )
+            specs_by_set["fine_tune_val"] = normalize_data(
+                specs_by_set["fine_tune_val"], norm_mean, norm_std
             )
             specs_by_set["test"] = normalize_data(
                 specs_by_set["test"], norm_mean, norm_std
@@ -300,7 +407,7 @@ def create_loocv_dataset(
     padded_X = {}
     padded_y = {}
 
-    for dataset_type in ["train", "val", "test"]:
+    for dataset_type in ["train", "val", "fine_tune_train", "fine_tune_val", "test"]:
         # Pad spectrogram sequences
         padded_X[dataset_type] = (
             tf.keras.preprocessing.sequence.pad_sequences(
@@ -337,11 +444,21 @@ def create_loocv_dataset(
     # Rename variables for clarity in the rest of the code
     X_train_padded, y_train_padded = padded_X["train"], padded_y["train"]
     X_val_padded, y_val_padded = padded_X["val"], padded_y["val"]
+    X_ft_train_padded, y_ft_train_padded = (
+        padded_X["fine_tune_train"],
+        padded_y["fine_tune_train"],
+    )
+    X_ft_val_padded, y_ft_val_padded = (
+        padded_X["fine_tune_val"],
+        padded_y["fine_tune_val"],
+    )
     X_test_padded, y_test_padded = padded_X["test"], padded_y["test"]
 
     # Apply shape standardization
     y_train_padded = ensure_label_shape(y_train_padded)
     y_val_padded = ensure_label_shape(y_val_padded)
+    y_ft_train_padded = ensure_label_shape(y_ft_train_padded)
+    y_ft_val_padded = ensure_label_shape(y_ft_val_padded)
     y_test_padded = ensure_label_shape(y_test_padded)
 
     logger.info(
@@ -349,6 +466,12 @@ def create_loocv_dataset(
     )
     logger.info(
         f"  Standardized Validation data shape: X={X_val_padded.shape}, y={y_val_padded.shape}"
+    )
+    logger.info(
+        f"  Standardized Fine-tune Train data shape: X={X_ft_train_padded.shape}, y={y_ft_train_padded.shape}"
+    )
+    logger.info(
+        f"  Standardized Fine-tune Val data shape: X={X_ft_val_padded.shape}, y={y_ft_val_padded.shape}"
     )
     logger.info(
         f"  Standardized Test data shape: X={X_test_padded.shape}, y={y_test_padded.shape}"
@@ -359,6 +482,16 @@ def create_loocv_dataset(
 
     train_dataset = create_tf_dataset(X_train_padded, y_train_padded, batch_size)
     val_dataset = create_tf_dataset(X_val_padded, y_val_padded, batch_size)
+    fine_tune_train_dataset = (
+        create_tf_dataset(X_ft_train_padded, y_ft_train_padded, batch_size)
+        if X_ft_train_padded.size > 0
+        else None
+    )
+    fine_tune_val_dataset = (
+        create_tf_dataset(X_ft_val_padded, y_ft_val_padded, batch_size)
+        if X_ft_val_padded.size > 0
+        else None
+    )
     test_dataset = create_tf_dataset(X_test_padded, y_test_padded, batch_size)
 
     # --- Determine Shapes ---
@@ -374,9 +507,12 @@ def create_loocv_dataset(
     return (
         train_dataset,
         val_dataset,
+        fine_tune_train_dataset,
+        fine_tune_val_dataset,
         test_dataset,
         input_shape,
         output_shape,
         norm_mean,
         norm_std,
+        test_recording_indices,
     )
