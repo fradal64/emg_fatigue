@@ -19,7 +19,7 @@ from emg_fatigue.utils.process_emg_data import process_all_participant_data
 
 # Define parameters
 NUM_FINE_TUNING_RECS = 4
-INITIAL_EPOCHS = 100
+INITIAL_EPOCHS = 200
 FINE_TUNE_EPOCHS = 100
 FINE_TUNE_LR = 1e-5
 

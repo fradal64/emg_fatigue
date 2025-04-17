@@ -6,8 +6,8 @@ from loguru import logger
 
 # Configuration constants (can be adjusted)
 NUM_HEADS = 8  # Number of attention heads
-FF_DIM = 512  # Hidden layer size in feed forward network inside transformer
-NUM_TRANSFORMER_BLOCKS = 4  # Number of transformer blocks
+FF_DIM = 256  # Hidden layer size in feed forward network inside transformer
+NUM_TRANSFORMER_BLOCKS = 3  # Number of transformer blocks
 D_MODEL = 256  # Embedding dimension (must be divisible by NUM_HEADS)
 DROPOUT_RATE = 0.1  # Dropout rate
 
