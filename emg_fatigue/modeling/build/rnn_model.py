@@ -115,7 +115,7 @@ def build_lstm_model(
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
         loss="mse",
-        metrics=["mae"],  # Mean Absolute Error is a common regression metric
+        metrics=["mae", "mse"],  # Mean Absolute Error is a common regression metric
     )
 
     return model, model_name

@@ -302,7 +302,7 @@ def build_transformer_model(
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
         loss="mse",
-        metrics=["mae"],
+        metrics=["mae", "mse"],
     )
 
     return model, model_name
