@@ -160,7 +160,7 @@ def fine_tune_model(
     model.compile(
         optimizer=tf.keras.optimizers.Adam(learning_rate=fine_tune_lr),
         loss="mse",
-        metrics=["mae"],
+        metrics=["mae", "mse"],
     )
 
     # --- Define Fine-tuning Callbacks ---
