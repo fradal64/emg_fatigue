@@ -5,10 +5,10 @@ import tensorflow as tf
 from loguru import logger
 
 # Configuration constants (can be adjusted)
-NUM_HEADS = 4  # Number of attention heads
-FF_DIM = 128  # Hidden layer size in feed forward network inside transformer
-NUM_TRANSFORMER_BLOCKS = 2  # Number of transformer blocks
-D_MODEL = 64  # Embedding dimension (must be divisible by NUM_HEADS)
+NUM_HEADS = 8  # Number of attention heads
+FF_DIM = 512  # Hidden layer size in feed forward network inside transformer
+NUM_TRANSFORMER_BLOCKS = 4  # Number of transformer blocks
+D_MODEL = 256  # Embedding dimension (must be divisible by NUM_HEADS)
 DROPOUT_RATE = 0.1  # Dropout rate
 
 

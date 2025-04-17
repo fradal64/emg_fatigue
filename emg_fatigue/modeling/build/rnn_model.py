@@ -3,7 +3,7 @@ from typing import List, Tuple
 import tensorflow as tf
 from loguru import logger
 
-RNN_UNITS = 128
+RNN_UNITS = 256
 DROPOUT_RATE = 0.3
 
 

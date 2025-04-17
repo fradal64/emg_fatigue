@@ -3,7 +3,7 @@ from typing import List, Tuple
 import tensorflow as tf
 from loguru import logger
 
-HIDDEN_UNITS = 128
+HIDDEN_UNITS = 512
 DROPOUT_RATE = 0.3
 
 

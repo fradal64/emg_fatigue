@@ -4,7 +4,7 @@ import tensorflow as tf
 from loguru import logger
 
 # Default configuration constants, can be overridden in the function call
-RNN_UNITS = 128
+RNN_UNITS = 256
 DROPOUT_RATE = 0.3
 
 
