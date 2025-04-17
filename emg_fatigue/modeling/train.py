@@ -27,8 +27,8 @@ def train_model(
         The training history object, or None if training could not start.
     """
     # Fixed hyperparameters
-    EARLY_STOPPING_PATIENCE = 10
-    REDUCE_LR_PATIENCE = 5
+    EARLY_STOPPING_PATIENCE = 20
+    REDUCE_LR_PATIENCE = 20
     REDUCE_LR_FACTOR = 0.5
     MIN_LR = 1e-6
 
@@ -52,12 +52,12 @@ def train_model(
 
     # --- Define Callbacks ---
     callbacks = [
-        tf.keras.callbacks.EarlyStopping(
-            monitor="val_loss",
-            patience=EARLY_STOPPING_PATIENCE,
-            restore_best_weights=True,
-            verbose=1,
-        ),
+        # tf.keras.callbacks.EarlyStopping(
+        #     monitor="val_loss",
+        #     patience=EARLY_STOPPING_PATIENCE,
+        #     restore_best_weights=True,
+        #     verbose=1,
+        # ), # Removed EarlyStopping
         tf.keras.callbacks.ReduceLROnPlateau(
             monitor="val_loss",
             factor=REDUCE_LR_FACTOR,
@@ -85,6 +85,16 @@ def train_model(
             verbose=1,
         )
         logger.info("Training finished.")
+
+        # Load the best weights saved by ModelCheckpoint
+        if model_save_path.exists():
+            logger.info(f"Loading best weights from {model_save_path}")
+            model.load_weights(str(model_save_path))
+        else:
+            logger.warning(
+                f"Could not find saved model weights at {model_save_path} to load best weights."
+            )
+
         return history
     except Exception as e:
         logger.error(f"An error occurred during model training: {e}")
@@ -120,7 +130,7 @@ def fine_tune_model(
     """
     # Fine-tuning specific hyperparameters
     FINE_TUNE_EARLY_STOPPING_PATIENCE = 5
-    FINE_TUNE_REDUCE_LR_PATIENCE = 3
+    FINE_TUNE_REDUCE_LR_PATIENCE = 20
     FINE_TUNE_REDUCE_LR_FACTOR = 0.5
     FINE_TUNE_MIN_LR = 1e-7
 
@@ -167,12 +177,12 @@ def fine_tune_model(
         )
 
     ft_callbacks = [
-        tf.keras.callbacks.EarlyStopping(
-            monitor=monitor_metric,
-            patience=FINE_TUNE_EARLY_STOPPING_PATIENCE,
-            restore_best_weights=True,
-            verbose=1,
-        ),
+        # tf.keras.callbacks.EarlyStopping(
+        #     monitor=monitor_metric,
+        #     patience=FINE_TUNE_EARLY_STOPPING_PATIENCE,
+        #     restore_best_weights=True,
+        #     verbose=1,
+        # ), # Removed EarlyStopping
         tf.keras.callbacks.ReduceLROnPlateau(
             monitor=monitor_metric,
             factor=FINE_TUNE_REDUCE_LR_FACTOR,
@@ -199,6 +209,18 @@ def fine_tune_model(
             verbose=1,
         )
         logger.info("Fine-tuning finished.")
+
+        # Load the best weights saved by ModelCheckpoint during fine-tuning
+        if fine_tuned_model_save_path.exists():
+            logger.info(
+                f"Loading best fine-tuned weights from {fine_tuned_model_save_path}"
+            )
+            model.load_weights(str(fine_tuned_model_save_path))
+        else:
+            logger.warning(
+                f"Could not find saved fine-tuned model weights at {fine_tuned_model_save_path} to load best weights."
+            )
+
         return history
     except Exception as e:
         logger.error(f"An error occurred during model fine-tuning: {e}")
