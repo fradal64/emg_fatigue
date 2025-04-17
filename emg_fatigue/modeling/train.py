@@ -38,7 +38,11 @@ def train_model(
 
     # Construct model save path using MODELS_DIR from config
     if not model_name.endswith((".h5", ".keras")):
-        model_name += ".keras"  # Add extension if not provided
+        model_name += ".h5"  # Use .h5 extension
+    elif model_name.endswith(".keras"):
+        model_name = model_name.replace(
+            ".keras", ".h5"
+        )  # Change existing .keras to .h5
 
     model_save_path = MODELS_DIR / model_name
 
@@ -143,7 +147,7 @@ def fine_tune_model(
         base_name = model_name.rsplit(".", 1)[0]
     else:
         base_name = model_name
-    fine_tuned_model_name = f"{base_name}_finetuned.keras"
+    fine_tuned_model_name = f"{base_name}_finetuned.h5"  # Use .h5 extension
     fine_tuned_model_save_path = MODELS_DIR / fine_tuned_model_name
 
     # Ensure the directory for saving the model exists
